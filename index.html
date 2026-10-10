@@ -1,8 +1,142 @@
-<!DOCTYPE html>
-<html>
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Kiểm tra IP bằng WebRTC</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#eef2ff;background:#0b1220}
+    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}
+    main{width:min(720px,100%);background:#151f32;border:1px solid #31415e;border-radius:22px;padding:30px;box-shadow:0 20px 70px #0005}
+    .eyebrow{color:#8dbbff;letter-spacing:.1em;font-weight:700;font-size:.75rem;text-transform:uppercase}h1{font-size:clamp(1.6rem,4vw,2.2rem);margin:10px 0}
+    p{color:#b7c5db;line-height:1.65}.status{display:flex;align-items:center;gap:10px;color:#d5e4ff;margin:22px 0}
+    .dot{width:9px;height:9px;background:#ffc36d;border-radius:50%}.dot.ok{background:#54dfac}.dot.bad{background:#ff8888}
+    .hero{border:1px solid #3c5676;background:#10233c;padding:22px;border-radius:16px;margin:20px 0}
+    .hero small{display:block;color:#a5bcdc;margin-bottom:8px}.hero strong{font-size:clamp(1.3rem,4vw,2rem);word-break:break-all;font-variant-numeric:tabular-nums}
+    .muted{color:#91a4be;font-size:.88rem}.buttons{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
+    button{background:#4d8aff;border:0;color:#07182b;border-radius:10px;padding:11px 16px;font-weight:750;cursor:pointer}button:disabled{opacity:.55;cursor:wait}
+    button.secondary{background:#2a3b55;color:#edf5ff}.rows{display:grid;gap:10px;margin-top:12px}
+    .row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:13px 15px;background:#1c2a40;border-radius:10px;flex-wrap:wrap}
+    .row code{font-size:.94rem;color:#eaf4ff;overflow-wrap:anywhere}.tag{font-size:.73rem;padding:4px 8px;background:#354d6a;color:#cfe3ff;border-radius:20px}
+    .note{border-top:1px solid #34445c;padding-top:14px;margin-top:20px;font-size:.91rem}a{color:#92bdff}
+  </style>
+</head>
 <body>
-
-<iframe src="https://playgama.com/export/game/deadly-descent" width="100%" height="900" scrolling="none" frameborder="0"></iframe>
-
+<main>
+  <div class="eyebrow">WebRTC / STUN</div>
+  <h1>Kiểm tra địa chỉ IP qua WebRTC</h1>
+  <p>Phát hiện những IP mà trình duyệt cho phép WebRTC tiết lộ, không yêu cầu quyền camera, microphone hay vị trí.</p>
+  <div class="status" aria-live="polite"><span class="dot" id="dot"></span><span id="status">Đang chuẩn bị kiểm tra...</span></div>
+  <div class="hero"><small>IP public qua WebRTC (server-reflexive)</small><strong id="primary">Đang kiểm tra...</strong><div class="muted" id="detail">Kết quả phụ thuộc trình duyệt, VPN và cấu hình mạng.</div></div>
+  <div class="buttons"><button id="retry">Kiểm tra lại</button><button class="secondary" id="copy" disabled>Sao chép IP</button></div>
+  <h2 style="font-size:1.08rem">ICE candidates được phát hiện</h2>
+  <div class="rows" id="results" aria-live="polite"><div class="row">Chưa có kết quả</div></div>
+  <p class="note"><strong>Lưu ý:</strong> IP <code>srflx</code> là địa chỉ public nhìn từ máy chủ STUN, không nhất thiết là IP gốc trước VPN. IP <code>host</code> có thể được ẩn bằng tên <code>.local</code> (mDNS). IP <code>relay</code> thuộc máy chủ TURN. VPN hoặc chính sách trình duyệt có thể ngăn WebRTC lộ IP gốc. Trang này không gửi kết quả về máy chủ riêng; việc dùng STUN vẫn tạo lưu lượng đến máy chủ STUN của Google.</p>
+</main>
+<script>
+(() => {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const retry = $('retry'), copy = $('copy'), primary = $('primary');
+  let currentIP = '', activePC = null, generation = 0;
+  const servers = [
+    {urls:'stun:stun.l.google.com:19302'},
+    {urls:'stun:stun1.l.google.com:19302'}
+  ];
+  function status(text, state='pending') {
+    $('status').textContent = text;
+    $('dot').className = 'dot' + (state === 'ok' ? ' ok' : state === 'bad' ? ' bad' : '');
+  }
+  function parseCandidate(candidate) {
+    const data = candidate.candidate || '';
+    const fields = data.split(/\s+/);
+    const typIndex = fields.indexOf('typ');
+    return {
+      ip: candidate.address || fields[4] || '',
+      type: candidate.type || (typIndex >= 0 ? fields[typIndex + 1] : 'unknown'),
+      protocol: candidate.protocol || fields[2] || 'unknown'
+    };
+  }
+  function draw(items) {
+    const root = $('results');
+    root.replaceChildren();
+    if (!items.length) { const item = document.createElement('div'); item.className='row'; item.textContent='Không có ICE candidate được cung cấp'; root.append(item); return; }
+    for (const item of items) {
+      const row = document.createElement('div'), label = document.createElement('code'), tag = document.createElement('span');
+      row.className='row'; label.textContent=item.ip; tag.className='tag'; tag.textContent=item.type+' / '+item.protocol;
+      row.append(label,tag);root.append(row);
+    }
+  }
+  async function check() {
+    const run = ++generation;
+    if (activePC) { activePC.close(); activePC = null; }
+    retry.disabled=true; copy.disabled=true; currentIP=''; primary.textContent='Đang kiểm tra...';
+    $('detail').textContent='Đang thu thập ICE candidates từ STUN.';
+    draw([]); status('Đang kiểm tra WebRTC...');
+    if (typeof RTCPeerConnection === 'undefined') {
+      primary.textContent='Không hỗ trợ';status('Trình duyệt không hỗ trợ WebRTC','bad');retry.disabled=false;return;
+    }
+    let pc;
+    const found = new Map();
+    try {
+      pc = new RTCPeerConnection({iceServers:servers,iceTransportPolicy:'all'});
+      activePC=pc;
+      const add = c => {
+        if (!c || run !== generation) return;
+        const item = parseCandidate(c);
+        if (!item.ip) return;
+        found.set(item.type+':'+item.ip+':'+item.protocol,item);
+        draw([...found.values()]);
+        const publicIP = [...found.values()].find(x=>x.type==='srflx');
+        if (publicIP) { currentIP=publicIP.ip;primary.textContent=currentIP;copy.disabled=false; }
+      };
+      pc.addEventListener('icecandidate', e => add(e.candidate));
+      pc.createDataChannel('ip-check');
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await Promise.race([
+        new Promise(resolve=>{
+          if (pc.iceGatheringState==='complete') return resolve();
+          pc.addEventListener('icegatheringstatechange',()=>{
+            if(pc.iceGatheringState==='complete')resolve();
+          });
+        }),
+        new Promise(resolve=>setTimeout(resolve,6500))
+      ]);
+      // Một số trình duyệt chỉ đưa candidates vào SDP.
+      const sdp = pc.localDescription?.sdp || '';
+      for (const line of sdp.split(/\r?\n/)) {
+        if (line.startsWith('a=candidate:')) add({candidate:line.slice(2)});
+      }
+      if (run!==generation) return;
+      if (currentIP) {
+        status('Đã tìm thấy IP public qua WebRTC','ok');
+        $('detail').textContent='Đây là IP server-reflexive do STUN phát hiện, không bảo đảm là IP mạng gốc nếu đang dùng VPN.';
+      } else {
+        primary.textContent='Không phát hiện';
+        status('Không tìm thấy IP public qua WebRTC','bad');
+        $('detail').textContent='STUN có thể bị chặn hoặc trình duyệt/VPN đang giới hạn ICE candidates.';
+      }
+    } catch(err) {
+      if (run!==generation) return;
+      primary.textContent='Không thể kiểm tra'; status('Lỗi WebRTC','bad');
+      $('detail').textContent=err && err.message ? err.message : String(err);
+    } finally {
+      if (pc) pc.close();
+      if (activePC===pc) activePC=null;
+      if (run===generation) retry.disabled=false;
+    }
+  }
+  retry.addEventListener('click',check);
+  copy.addEventListener('click',async()=>{
+    if(!currentIP)return;
+    try { await navigator.clipboard.writeText(currentIP);copy.textContent='Đã sao chép'; }
+    catch { copy.textContent='Không sao chép được'; }
+    setTimeout(()=>copy.textContent='Sao chép IP',1800);
+  });
+  check();
+})();
+</script>
 </body>
 </html>
