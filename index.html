@@ -1,177 +1,50 @@
 <!doctype html>
-<html lang="vi">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="color-scheme" content="dark">
-  <title>Kiểm tra IP bằng WebRTC</title>
-  <style>
-    :root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#eef2ff;background:#0b1220}
-    *{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px}
-    main{width:min(720px,100%);background:#151f32;border:1px solid #31415e;border-radius:22px;padding:30px;box-shadow:0 20px 70px #0005}
-    .eyebrow{color:#8dbbff;letter-spacing:.1em;font-weight:700;font-size:.75rem;text-transform:uppercase}h1{font-size:clamp(1.6rem,4vw,2.2rem);margin:10px 0}
-    p{color:#b7c5db;line-height:1.65}.status{display:flex;align-items:center;gap:10px;color:#d5e4ff;margin:22px 0}
-    .dot{width:9px;height:9px;background:#ffc36d;border-radius:50%}.dot.ok{background:#54dfac}.dot.bad{background:#ff8888}
-    .hero{border:1px solid #3c5676;background:#10233c;padding:22px;border-radius:16px;margin:20px 0}
-    .hero small{display:block;color:#a5bcdc;margin-bottom:8px}.hero strong{font-size:clamp(1.3rem,4vw,2rem);word-break:break-all;font-variant-numeric:tabular-nums}
-    .muted{color:#91a4be;font-size:.88rem}.buttons{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
-    button{background:#4d8aff;border:0;color:#07182b;border-radius:10px;padding:11px 16px;font-weight:750;cursor:pointer}button:disabled{opacity:.55;cursor:wait}
-    button.secondary{background:#2a3b55;color:#edf5ff}.rows{display:grid;gap:10px;margin-top:12px}
-    .row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:13px 15px;background:#1c2a40;border-radius:10px;flex-wrap:wrap}
-    .row code{font-size:.94rem;color:#eaf4ff;overflow-wrap:anywhere}.tag{font-size:.73rem;padding:4px 8px;background:#354d6a;color:#cfe3ff;border-radius:20px}
-    .note{border-top:1px solid #34445c;padding-top:14px;margin-top:20px;font-size:.91rem}a{color:#92bdff}
-  </style>
-</head>
-<body>
-<main>
-  <div class="eyebrow">WebRTC / STUN</div>
-  <h1>Kiểm tra địa chỉ IP qua WebRTC</h1>
-  <p>Ưu tiên IP từ WebRTC/STUN. Nếu WebRTC không cung cấp IP public, trang sẽ hiển thị IP mà dịch vụ HTTPS nhìn thấy. Không yêu cầu quyền camera, microphone hay vị trí.</p>
-  <div class="status" aria-live="polite"><span class="dot" id="dot"></span><span id="status">Đang chuẩn bị kiểm tra...</span></div>
-  <div class="hero"><small>Địa chỉ IP public mà trang xác định được</small><strong id="primary">Đang kiểm tra...</strong><div class="muted" id="detail">Kết quả sẽ ghi rõ được lấy từ WebRTC hay dịch vụ HTTPS.</div></div>
-  <div class="buttons"><button id="retry">Kiểm tra lại</button><button class="secondary" id="copy" disabled>Sao chép IP</button></div>
-  <h2 style="font-size:1.08rem">ICE candidates được phát hiện</h2>
-  <div class="rows" id="results" aria-live="polite"><div class="row">Chưa có kết quả</div></div>
-  <p class="note"><strong>Lưu ý:</strong> IP <code>srflx</code> là địa chỉ public nhìn từ máy chủ STUN, không nhất thiết là IP gốc trước VPN. IP <code>host</code> có thể được ẩn bằng tên <code>.local</code> (mDNS). IP <code>relay</code> thuộc máy chủ TURN. VPN hoặc chính sách trình duyệt có thể ngăn WebRTC lộ IP gốc. Trang không lưu IP trên máy chủ của riêng mình. Kiểm tra STUN kết nối đến máy chủ Google; phương án dự phòng truy vấn dịch vụ IP công khai (ipify). Các dịch vụ này nhìn thấy địa chỉ IP nguồn của yêu cầu đến chúng.</p>
-</main>
-<script>
-(() => {
-  'use strict';
-  const $ = id => document.getElementById(id);
-  const retry = $('retry'), copy = $('copy'), primary = $('primary');
-  let currentIP = '', activePC = null, generation = 0;
-  const servers = [
-    {urls:'stun:stun.l.google.com:19302'},
-    {urls:'stun:stun1.l.google.com:19302'}
-  ];
-  function status(text, state='pending') {
-    $('status').textContent = text;
-    $('dot').className = 'dot' + (state === 'ok' ? ' ok' : state === 'bad' ? ' bad' : '');
-  }
-  function parseCandidate(candidate) {
-    const data = candidate.candidate || '';
-    const fields = data.split(/\s+/);
-    const typIndex = fields.indexOf('typ');
-    return {
-      ip: candidate.address || fields[4] || '',
-      type: candidate.type || (typIndex >= 0 ? fields[typIndex + 1] : 'unknown'),
-      protocol: candidate.protocol || fields[2] || 'unknown'
-    };
-  }
-  async function getPublicIP() {
-    // Dịch vụ HTTPS nhìn thấy IP đi ra Internet, kể cả khi WebRTC bị giới hạn.
-    const endpoints = [
-      'https://api64.ipify.org?format=json',
-      'https://api.ipify.org?format=json'
-    ];
-    for (const url of endpoints) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
-      try {
-        const response = await fetch(url, {signal:controller.signal, cache:'no-store'});
-        if (!response.ok) continue;
-        const data = await response.json();
-        if (typeof data.ip === 'string' && /^[0-9a-f:.]+$/i.test(data.ip)) return data.ip;
-      } catch (_) {
-        // Nếu endpoint đầu không truy cập được, thử endpoint tiếp theo.
-      } finally { clearTimeout(timer); }
-    }
-    return '';
-  }
-  function showIP(ip, description, message) {
-    currentIP=ip;
-    primary.textContent=ip;
-    copy.disabled=false;
-    $('detail').textContent=description;
-    status(message, 'ok');
-  }
-  function draw(items) {
-    const root = $('results');
-    root.replaceChildren();
-    if (!items.length) { const item = document.createElement('div'); item.className='row'; item.textContent='Không có ICE candidate được cung cấp'; root.append(item); return; }
-    for (const item of items) {
-      const row = document.createElement('div'), label = document.createElement('code'), tag = document.createElement('span');
-      row.className='row'; label.textContent=item.ip; tag.className='tag'; tag.textContent=item.type+' / '+item.protocol;
-      row.append(label,tag);root.append(row);
-    }
-  }
-  async function check() {
-    const run = ++generation;
-    if (activePC) { activePC.close(); activePC = null; }
-    retry.disabled=true; copy.disabled=true; currentIP=''; primary.textContent='Đang kiểm tra...';
-    $('detail').textContent='Đang kiểm tra WebRTC và chuẩn bị phương án HTTPS dự phòng.';
-    draw([]); status('Đang kiểm tra địa chỉ IP...');
-    // Khởi chạy truy vấn dự phòng đồng thời để kết quả sẵn có khi WebRTC không trả IP.
-    const fallback = getPublicIP();
-    let pc;
-    const found = new Map();
-    let webrtcIP = '';
-    try {
-      if (typeof RTCPeerConnection !== 'undefined') {
-        try {
-          pc = new RTCPeerConnection({iceServers:servers,iceTransportPolicy:'all'});
-          activePC=pc;
-          const add = c => {
-            if (!c || run !== generation) return;
-            const item = parseCandidate(c);
-            if (!item.ip) return;
-            found.set(item.type+':'+item.ip+':'+item.protocol,item);
-            draw([...found.values()]);
-            if (item.type==='srflx' && !webrtcIP) {
-              webrtcIP=item.ip;
-              showIP(item.ip,'Nguồn: WebRTC/STUN. IP này không nhất thiết là IP gốc trước VPN.','Đã tìm thấy IP public qua WebRTC');
-            }
-          };
-          pc.addEventListener('icecandidate', e => add(e.candidate));
-          pc.createDataChannel('ip-check');
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          await Promise.race([
-            new Promise(resolve=>{
-              if (pc.iceGatheringState==='complete') return resolve();
-              pc.addEventListener('icegatheringstatechange',()=>{
-                if(pc.iceGatheringState==='complete')resolve();
-              });
-            }),
-            new Promise(resolve=>setTimeout(resolve,6500))
-          ]);
-          const sdp = pc.localDescription?.sdp || '';
-          for (const line of sdp.split(/\r?\n/)) {
-            if (line.startsWith('a=candidate:')) add({candidate:line.slice(2)});
-          }
-        } catch (err) {
-          if (run===generation) $('detail').textContent='WebRTC không khả dụng, đang dùng phương án HTTPS.';
-        }
-      }
-      if (run !== generation) return;
-      if (!webrtcIP) {
-        primary.textContent='Đang lấy IP từ HTTPS...';
-        status('Đang truy vấn IP public qua HTTPS...');
-        const ip = await fallback;
-        if (run !== generation) return;
-        if (ip) {
-          showIP(ip,'Nguồn: dịch vụ HTTPS ipify. Đây là IP mà website nhìn thấy, có thể là IP VPN hoặc proxy.','Đã xác định IP public qua HTTPS');
-        } else {
-          primary.textContent='Không thể xác định IP';
-          status('Không truy cập được dịch vụ kiểm tra IP','bad');
-          $('detail').textContent='Không nhận được IP từ WebRTC hoặc HTTPS. Kiểm tra kết nối mạng, trình chặn quảng cáo hoặc chính sách CORS.';
-        }
-      }
-    } finally {
-      if (pc) pc.close();
-      if (activePC===pc) activePC=null;
-      if (run===generation) retry.disabled=false;
-    }
-  }
-  retry.addEventListener('click',check);
-  copy.addEventListener('click',async()=>{
-    if(!currentIP)return;
-    try { await navigator.clipboard.writeText(currentIP);copy.textContent='Đã sao chép'; }
-    catch { copy.textContent='Không sao chép được'; }
-    setTimeout(()=>copy.textContent='Sao chép IP',1800);
-  });
-  check();
-})();
-</script>
-</body>
-</html>
+<html lang="vi"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="dark"><title>Advanced IP Leak Test</title>
+<style>
+:root{font-family:Inter,system-ui,-apple-system,'Segoe UI',sans-serif;background:#080e1b;color:#f1f5ff}*{box-sizing:border-box}body{margin:0;padding:24px 16px}main{max-width:870px;margin:auto}.eyebrow{letter-spacing:.17em;text-transform:uppercase;color:#79c3ff;font-size:12px;font-weight:800}h1{font-size:clamp(30px,5vw,44px);margin:12px 0}p{line-height:1.65;color:#b5c2dc}h2{font-size:18px;margin:0 0 16px}.panel{background:#111d30;border:1px solid #30415f;border-radius:18px;padding:22px;margin-top:18px}.hero{background:linear-gradient(135deg,#183b5d,#10213a);border-color:#477baf}.caption{font-size:13px;color:#aac5e3}.mainip{font-size:clamp(25px,5vw,39px);font-weight:800;overflow-wrap:anywhere;display:block;margin:10px 0;font-variant-numeric:tabular-nums}.pill{display:inline-block;border:1px solid #47708e;border-radius:22px;padding:5px 10px;color:#b6dfff;font-size:12px}.state{display:flex;align-items:center;gap:10px;margin:18px 0;color:#cae0fa}.dot{width:10px;height:10px;border-radius:50%;background:#e7bc69}.dot.ok{background:#4ae1a3}.dot.warn{background:#ffb35e}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}@media(max-width:600px){.grid{grid-template-columns:1fr}.panel{padding:18px}}.stat{min-height:90px}.stat strong{display:block;margin-top:8px;overflow-wrap:anywhere;font-size:20px}.buttons{display:flex;gap:10px;flex-wrap:wrap;margin-top:18px}button{background:#62acff;color:#061324;border:0;border-radius:11px;padding:12px 18px;font-weight:800;cursor:pointer}button.alt{background:#293e5c;color:#eaf3ff}button:disabled{opacity:.55;cursor:wait}.rows{display:grid;gap:9px}.item{display:grid;grid-template-columns:1fr auto;gap:10px;padding:12px 14px;border:1px solid #30445e;border-radius:11px;background:#16263a}.item code{display:block;margin-top:5px;overflow-wrap:anywhere;font-size:13px}.tag{background:#263e55;color:#b9daf2;border-radius:14px;padding:4px 8px;font-size:11px;white-space:nowrap}.small{font-size:13px;color:#91a8c6}.alert{border-left:3px solid #eeb765;padding:11px 15px;background:#2a2731;border-radius:7px}.muted{color:#a1b2cd}.footer{font-size:13px;margin:25px 0 40px}a{color:#8dc7ff}
+</style></head><body><main>
+<div class="eyebrow">Network diagnostics · WebRTC · STUN · HTTPS</div>
+<h1>Advanced IP Leak Test</h1><p>Kiểm tra các địa chỉ IP được lộ qua WebRTC và các yêu cầu HTTPS. Không yêu cầu camera, microphone hay vị trí. Kết quả xử lý ngay trong trình duyệt và không tự động gửi về máy chủ của trang này.</p>
+<div class="state" role="status" aria-live="polite"><span id="dot" class="dot"></span><span id="status">Đang khởi tạo...</span></div>
+<section class="panel hero"><div class="caption">ĐỊA CHỈ IP PUBLIC ƯU TIÊN HIỂN THỊ</div><strong class="mainip" id="mainIP">Đang kiểm tra...</strong><span class="pill" id="source">Đang thu thập</span><p class="small" id="explanation">Kết quả sẽ ghi rõ IP được phát hiện qua WebRTC hay HTTPS.</p><div class="buttons"><button id="retry">Kiểm tra lại</button><button id="copy" class="alt" disabled>Sao chép IP</button><button id="export" class="alt">Xuất kết quả JSON</button></div></section>
+<div class="grid"><section class="panel stat"><div class="caption">HTTPS IPv4</div><strong id="ipv4">Đang kiểm tra...</strong></section><section class="panel stat"><div class="caption">HTTPS IPv6</div><strong id="ipv6">Đang kiểm tra...</strong></section></div>
+<section class="panel"><h2>Phân tích IP public</h2><div id="analysis" class="small" aria-live="polite">Đang so sánh kết quả...</div></section>
+<section class="panel"><h2>WebRTC ICE candidates</h2><div class="rows" id="candidates"><div class="muted">Đang thu thập...</div></div></section>
+<section class="panel"><h2>Nguồn kiểm tra</h2><div class="rows" id="endpoints"><div class="muted">Đang kiểm tra...</div></div></section>
+<p class="footer">Lưu ý: IP <b>srflx</b> là địa chỉ public được STUN nhìn thấy. <b>host</b> có thể là IP cục bộ hoặc tên mDNS <code>.local</code>. HTTPS cho biết IP nguồn của kết nối web. Nếu đang sử dụng VPN/proxy, kết quả có thể là địa chỉ của VPN/proxy. Công cụ không thể đảm bảo khám phá IP gốc được bảo vệ. Các yêu cầu được gửi trực tiếp từ trình duyệt đến nhà cung cấp STUN và HTTPS được liệt kê bên trên.</p>
+</main><script>
+(()=>{'use strict';
+const $=id=>document.getElementById(id);
+const services=[
+ {name:'ipify IPv4',url:'https://api.ipify.org?format=json',family:4,format:'json'},
+ {name:'ipify IPv6',url:'https://api6.ipify.org?format=json',family:6,format:'json'},
+ {name:'ipify IPv4/IPv6',url:'https://api64.ipify.org?format=json',family:0,format:'json'},
+ {name:'ipinfo',url:'https://ipinfo.io/json',family:0,format:'json'}
+];
+const stun=[
+ {urls:'stun:stun.l.google.com:19302'},
+ {urls:'stun:stun1.l.google.com:19302'},
+ {urls:'stun:stun2.l.google.com:19302'},
+ {urls:'stun:stun3.l.google.com:19302'},
+ {urls:'stun:stun4.l.google.com:19302'}
+];
+let generation=0,activePCs=[],current='',report={};
+const ip4=v=>{const p=v.split('.');return p.length===4&&p.every(x=>/^\d{1,3}$/.test(x)&&Number(x)<=255)};
+const ip6=v=>v.includes(':')&&/^[0-9a-f:.%]+$/i.test(v)&&!ip4(v);
+const isIP=v=>typeof v==='string'&&(ip4(v)||ip6(v));
+const isPublic=v=>{if(ip4(v)){const p=v.split('.').map(Number);return !(p[0]===0||p[0]===10||p[0]===127||p[0]>=224||(p[0]===100&&p[1]>=64&&p[1]<=127)||(p[0]===169&&p[1]===254)||(p[0]===172&&p[1]>=16&&p[1]<=31)||(p[0]===192&&p[1]===168)||(p[0]===192&&p[1]===0&&p[2]===2)||(p[0]===198&&p[1]===51&&p[2]===100)||(p[0]===203&&p[1]===0&&p[2]===113));}if(ip6(v)){const x=v.toLowerCase();return !(x==='::1'||x==='::'||x.startsWith('fe8')||x.startsWith('fe9')||x.startsWith('fea')||x.startsWith('feb')||x.startsWith('fc')||x.startsWith('fd')||x.startsWith('ff'));}return false};
+function renderStatus(s,kind=''){ $('status').textContent=s;$('dot').className='dot '+kind; }
+function addItem(root,top,detail,tag){const e=document.createElement('div');e.className='item';const lhs=document.createElement('div'),t=document.createElement('b'),d=document.createElement('code'),rhs=document.createElement('span');t.textContent=top;d.textContent=detail;rhs.className='tag';rhs.textContent=tag;lhs.append(t,d);e.append(lhs,rhs);root.append(e)}
+function candidateInfo(c){const raw=c.candidate||'';const a=raw.trim().split(/\s+/);const ix=a.indexOf('typ');return {ip:c.address||a[4]||'',type:c.type||(ix>=0?a[ix+1]:'unknown'),protocol:c.protocol||a[2]||'',port:c.port||a[5]||'',raw};}
+async function httpsProbe(service,token){const ctrl=new AbortController();const timeout=setTimeout(()=>ctrl.abort(),6500);try{const response=await fetch(service.url,{signal:ctrl.signal,cache:'no-store'});if(!response.ok)throw Error('HTTP '+response.status);const body=await response.json();const ip=body.ip;if(!isIP(ip))throw Error('Không có IP hợp lệ');if(token!==generation)return null;return {service:service.name,ip,family:ip4(ip)?4:6,status:'OK'};}catch(e){return {service:service.name,ip:'',status:e.name==='AbortError'?'Hết thời gian':'Không truy cập được / CORS'};}finally{clearTimeout(timeout)}}
+async function rtcProbe(token){if(!window.RTCPeerConnection)return {items:[],error:'Trình duyệt không hỗ trợ RTCPeerConnection'};const pc=new RTCPeerConnection({iceServers:stun,iceTransportPolicy:'all'});activePCs.push(pc);const found=new Map();const add=c=>{if(!c||token!==generation)return;const x=candidateInfo(c);if(x.ip)found.set(`${x.type}|${x.ip}|${x.protocol}|${x.port}`,x)};pc.addEventListener('icecandidate',e=>add(e.candidate));try{pc.createDataChannel('diagnostic');const offer=await pc.createOffer();await pc.setLocalDescription(offer);await Promise.race([new Promise(resolve=>{if(pc.iceGatheringState==='complete')return resolve();pc.addEventListener('icegatheringstatechange',()=>{if(pc.iceGatheringState==='complete')resolve()})}),new Promise(resolve=>setTimeout(resolve,6500))]);const sdp=pc.localDescription?.sdp||'';for(const line of sdp.split(/\r?\n/)){if(line.startsWith('a=candidate:'))add({candidate:line.slice(2)});}return {items:[...found.values()],error:''};}catch(e){return {items:[...found.values()],error:e.message||'Không thể kiểm tra WebRTC'};}finally{pc.close();activePCs=activePCs.filter(x=>x!==pc)}}
+function updateView(web,rtc){const httpsIPs=[...new Set(web.filter(x=>x?.ip&&isPublic(x.ip)).map(x=>x.ip))];const rtcIPs=[...new Set(rtc.items.filter(x=>x.type==='srflx'&&isPublic(x.ip)).map(x=>x.ip))];const httpsV4=httpsIPs.find(ip4)||'',httpsV6=httpsIPs.find(ip6)||'';
+$('ipv4').textContent=httpsV4||'Chưa có kết quả';$('ipv6').textContent=httpsV6||'Chưa có kết quả';const preferred=rtcIPs.find(ip4)||rtcIPs[0]||httpsV4||httpsV6||'';current=preferred;$('mainIP').textContent=preferred||'Không xác định được IP';$('copy').disabled=!preferred;
+$('source').textContent=rtcIPs.includes(preferred)?'WebRTC / STUN':preferred?'HTTPS':'Không có kết quả';$('explanation').textContent=preferred?(rtcIPs.includes(preferred)?'IP public được phát hiện qua STUN. Đây không nhất thiết là IP gốc trước VPN.':'IP public mà dịch vụ HTTPS nhìn thấy, được dùng khi WebRTC không trả về IP public.'):'Cả WebRTC và HTTPS đều không trả về IP public. Hãy kiểm tra kết nối hoặc chặn mạng.';
+const others=rtcIPs.filter(ip=>!httpsIPs.includes(ip));const node=$('analysis');node.replaceChildren();let info='';if(others.length)info='Phát hiện IP public qua WebRTC khác với IP HTTPS: '+others.join(', ')+'. Đây là dấu hiệu có thể cần kiểm tra rò rỉ IP, không đủ để kết luận IP nào là IP gốc.';else if(rtcIPs.length&&httpsIPs.length)info='IP WebRTC và HTTPS có địa chỉ trùng nhau ở ít nhất một đường kết nối. Không phát hiện chênh lệch tại các nguồn này.';else if(httpsIPs.length)info='WebRTC không cung cấp IP public. Đang hiển thị IP HTTPS. Không thể kết luận có hay không rò rỉ IP WebRTC.';else if(rtcIPs.length)info='Chỉ phát hiện IP public từ WebRTC. Không lấy được IP qua HTTPS.';else info='Không có IP public khả dụng từ các phép thử. Không thể suy đoán địa chỉ IP thật.';node.textContent=info;
+const cr=$('candidates');cr.replaceChildren();if(!rtc.items.length)addItem(cr,'WebRTC','Không có ICE candidate khả dụng',rtc.error||'Đã hoàn thành');else rtc.items.forEach(x=>addItem(cr,x.ip,`${x.protocol.toUpperCase()} · port ${x.port||'?'} · ${isPublic(x.ip)?'public':'local/mDNS/khác'}`,x.type));
+const er=$('endpoints');er.replaceChildren();web.forEach(x=>addItem(er,x.service,x.ip||x.status,x.ip?'HTTPS IP':'Không có dữ liệu'));
+report={generatedAt:new Date().toISOString(),displayedIP:preferred,https:web,iceCandidates:rtc.items,publicWebRTC:rtcIPs,publicHTTPS:httpsIPs,notice:'Không đảm bảo xác định IP gốc khi dùng VPN/proxy.'};renderStatus(preferred?'Hoàn tất kiểm tra':'Không thể lấy IP qua các nguồn hiện có',preferred?'ok':'warn');}
+async function run(){const token=++generation;activePCs.forEach(pc=>{try{pc.close()}catch{}});activePCs=[];current='';$('copy').disabled=true;$('retry').disabled=true;$('mainIP').textContent='Đang kiểm tra...';$('source').textContent='Đang thu thập';$('ipv4').textContent='Đang kiểm tra...';$('ipv6').textContent='Đang kiểm tra...';$('analysis').textContent='Đang đối chiếu các kết quả...';$('candidates').textContent='Đang thu thập...';$('endpoints').textContent='Đang truy vấn...';renderStatus('Đang kiểm tra song song WebRTC và HTTPS...');try{const [web,rtc]=await Promise.all([Promise.all(services.map(s=>httpsProbe(s,token))),rtcProbe(token)]);if(token===generation)updateView(web,rtc)}finally{if(token===generation)$('retry').disabled=false}}
+$('retry').addEventListener('click',run);$('copy').addEventListener('click',async()=>{if(!current)return;try{await navigator.clipboard.writeText(current);$('copy').textContent='Đã sao chép';setTimeout(()=>$('copy').textContent='Sao chép IP',1500)}catch{prompt('Sao chép IP:',current)}});$('export').addEventListener('click',()=>{const blob=new Blob([JSON.stringify(report,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const link=document.createElement('a');link.href=url;link.download='ip-leak-test.json';link.click();setTimeout(()=>URL.revokeObjectURL(url),2000)});run();
+})();</script></body></html>
