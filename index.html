@@ -26,13 +26,13 @@
 <main>
   <div class="eyebrow">WebRTC / STUN</div>
   <h1>Kiểm tra địa chỉ IP qua WebRTC</h1>
-  <p>Phát hiện những IP mà trình duyệt cho phép WebRTC tiết lộ, không yêu cầu quyền camera, microphone hay vị trí.</p>
+  <p>Ưu tiên IP từ WebRTC/STUN. Nếu WebRTC không cung cấp IP public, trang sẽ hiển thị IP mà dịch vụ HTTPS nhìn thấy. Không yêu cầu quyền camera, microphone hay vị trí.</p>
   <div class="status" aria-live="polite"><span class="dot" id="dot"></span><span id="status">Đang chuẩn bị kiểm tra...</span></div>
-  <div class="hero"><small>IP public qua WebRTC (server-reflexive)</small><strong id="primary">Đang kiểm tra...</strong><div class="muted" id="detail">Kết quả phụ thuộc trình duyệt, VPN và cấu hình mạng.</div></div>
+  <div class="hero"><small>Địa chỉ IP public mà trang xác định được</small><strong id="primary">Đang kiểm tra...</strong><div class="muted" id="detail">Kết quả sẽ ghi rõ được lấy từ WebRTC hay dịch vụ HTTPS.</div></div>
   <div class="buttons"><button id="retry">Kiểm tra lại</button><button class="secondary" id="copy" disabled>Sao chép IP</button></div>
   <h2 style="font-size:1.08rem">ICE candidates được phát hiện</h2>
   <div class="rows" id="results" aria-live="polite"><div class="row">Chưa có kết quả</div></div>
-  <p class="note"><strong>Lưu ý:</strong> IP <code>srflx</code> là địa chỉ public nhìn từ máy chủ STUN, không nhất thiết là IP gốc trước VPN. IP <code>host</code> có thể được ẩn bằng tên <code>.local</code> (mDNS). IP <code>relay</code> thuộc máy chủ TURN. VPN hoặc chính sách trình duyệt có thể ngăn WebRTC lộ IP gốc. Trang này không gửi kết quả về máy chủ riêng; việc dùng STUN vẫn tạo lưu lượng đến máy chủ STUN của Google.</p>
+  <p class="note"><strong>Lưu ý:</strong> IP <code>srflx</code> là địa chỉ public nhìn từ máy chủ STUN, không nhất thiết là IP gốc trước VPN. IP <code>host</code> có thể được ẩn bằng tên <code>.local</code> (mDNS). IP <code>relay</code> thuộc máy chủ TURN. VPN hoặc chính sách trình duyệt có thể ngăn WebRTC lộ IP gốc. Trang không lưu IP trên máy chủ của riêng mình. Kiểm tra STUN kết nối đến máy chủ Google; phương án dự phòng truy vấn dịch vụ IP công khai (ipify). Các dịch vụ này nhìn thấy địa chỉ IP nguồn của yêu cầu đến chúng.</p>
 </main>
 <script>
 (() => {
@@ -58,6 +58,33 @@
       protocol: candidate.protocol || fields[2] || 'unknown'
     };
   }
+  async function getPublicIP() {
+    // Dịch vụ HTTPS nhìn thấy IP đi ra Internet, kể cả khi WebRTC bị giới hạn.
+    const endpoints = [
+      'https://api64.ipify.org?format=json',
+      'https://api.ipify.org?format=json'
+    ];
+    for (const url of endpoints) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(url, {signal:controller.signal, cache:'no-store'});
+        if (!response.ok) continue;
+        const data = await response.json();
+        if (typeof data.ip === 'string' && /^[0-9a-f:.]+$/i.test(data.ip)) return data.ip;
+      } catch (_) {
+        // Nếu endpoint đầu không truy cập được, thử endpoint tiếp theo.
+      } finally { clearTimeout(timer); }
+    }
+    return '';
+  }
+  function showIP(ip, description, message) {
+    currentIP=ip;
+    primary.textContent=ip;
+    copy.disabled=false;
+    $('detail').textContent=description;
+    status(message, 'ok');
+  }
   function draw(items) {
     const root = $('results');
     root.replaceChildren();
@@ -72,56 +99,64 @@
     const run = ++generation;
     if (activePC) { activePC.close(); activePC = null; }
     retry.disabled=true; copy.disabled=true; currentIP=''; primary.textContent='Đang kiểm tra...';
-    $('detail').textContent='Đang thu thập ICE candidates từ STUN.';
-    draw([]); status('Đang kiểm tra WebRTC...');
-    if (typeof RTCPeerConnection === 'undefined') {
-      primary.textContent='Không hỗ trợ';status('Trình duyệt không hỗ trợ WebRTC','bad');retry.disabled=false;return;
-    }
+    $('detail').textContent='Đang kiểm tra WebRTC và chuẩn bị phương án HTTPS dự phòng.';
+    draw([]); status('Đang kiểm tra địa chỉ IP...');
+    // Khởi chạy truy vấn dự phòng đồng thời để kết quả sẵn có khi WebRTC không trả IP.
+    const fallback = getPublicIP();
     let pc;
     const found = new Map();
+    let webrtcIP = '';
     try {
-      pc = new RTCPeerConnection({iceServers:servers,iceTransportPolicy:'all'});
-      activePC=pc;
-      const add = c => {
-        if (!c || run !== generation) return;
-        const item = parseCandidate(c);
-        if (!item.ip) return;
-        found.set(item.type+':'+item.ip+':'+item.protocol,item);
-        draw([...found.values()]);
-        const publicIP = [...found.values()].find(x=>x.type==='srflx');
-        if (publicIP) { currentIP=publicIP.ip;primary.textContent=currentIP;copy.disabled=false; }
-      };
-      pc.addEventListener('icecandidate', e => add(e.candidate));
-      pc.createDataChannel('ip-check');
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await Promise.race([
-        new Promise(resolve=>{
-          if (pc.iceGatheringState==='complete') return resolve();
-          pc.addEventListener('icegatheringstatechange',()=>{
-            if(pc.iceGatheringState==='complete')resolve();
-          });
-        }),
-        new Promise(resolve=>setTimeout(resolve,6500))
-      ]);
-      // Một số trình duyệt chỉ đưa candidates vào SDP.
-      const sdp = pc.localDescription?.sdp || '';
-      for (const line of sdp.split(/\r?\n/)) {
-        if (line.startsWith('a=candidate:')) add({candidate:line.slice(2)});
+      if (typeof RTCPeerConnection !== 'undefined') {
+        try {
+          pc = new RTCPeerConnection({iceServers:servers,iceTransportPolicy:'all'});
+          activePC=pc;
+          const add = c => {
+            if (!c || run !== generation) return;
+            const item = parseCandidate(c);
+            if (!item.ip) return;
+            found.set(item.type+':'+item.ip+':'+item.protocol,item);
+            draw([...found.values()]);
+            if (item.type==='srflx' && !webrtcIP) {
+              webrtcIP=item.ip;
+              showIP(item.ip,'Nguồn: WebRTC/STUN. IP này không nhất thiết là IP gốc trước VPN.','Đã tìm thấy IP public qua WebRTC');
+            }
+          };
+          pc.addEventListener('icecandidate', e => add(e.candidate));
+          pc.createDataChannel('ip-check');
+          const offer = await pc.createOffer();
+          await pc.setLocalDescription(offer);
+          await Promise.race([
+            new Promise(resolve=>{
+              if (pc.iceGatheringState==='complete') return resolve();
+              pc.addEventListener('icegatheringstatechange',()=>{
+                if(pc.iceGatheringState==='complete')resolve();
+              });
+            }),
+            new Promise(resolve=>setTimeout(resolve,6500))
+          ]);
+          const sdp = pc.localDescription?.sdp || '';
+          for (const line of sdp.split(/\r?\n/)) {
+            if (line.startsWith('a=candidate:')) add({candidate:line.slice(2)});
+          }
+        } catch (err) {
+          if (run===generation) $('detail').textContent='WebRTC không khả dụng, đang dùng phương án HTTPS.';
+        }
       }
-      if (run!==generation) return;
-      if (currentIP) {
-        status('Đã tìm thấy IP public qua WebRTC','ok');
-        $('detail').textContent='Đây là IP server-reflexive do STUN phát hiện, không bảo đảm là IP mạng gốc nếu đang dùng VPN.';
-      } else {
-        primary.textContent='Không phát hiện';
-        status('Không tìm thấy IP public qua WebRTC','bad');
-        $('detail').textContent='STUN có thể bị chặn hoặc trình duyệt/VPN đang giới hạn ICE candidates.';
+      if (run !== generation) return;
+      if (!webrtcIP) {
+        primary.textContent='Đang lấy IP từ HTTPS...';
+        status('Đang truy vấn IP public qua HTTPS...');
+        const ip = await fallback;
+        if (run !== generation) return;
+        if (ip) {
+          showIP(ip,'Nguồn: dịch vụ HTTPS ipify. Đây là IP mà website nhìn thấy, có thể là IP VPN hoặc proxy.','Đã xác định IP public qua HTTPS');
+        } else {
+          primary.textContent='Không thể xác định IP';
+          status('Không truy cập được dịch vụ kiểm tra IP','bad');
+          $('detail').textContent='Không nhận được IP từ WebRTC hoặc HTTPS. Kiểm tra kết nối mạng, trình chặn quảng cáo hoặc chính sách CORS.';
+        }
       }
-    } catch(err) {
-      if (run!==generation) return;
-      primary.textContent='Không thể kiểm tra'; status('Lỗi WebRTC','bad');
-      $('detail').textContent=err && err.message ? err.message : String(err);
     } finally {
       if (pc) pc.close();
       if (activePC===pc) activePC=null;
